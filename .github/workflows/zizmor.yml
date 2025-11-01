@@ -1,8 +1,6 @@
 name: Zizmor
 
-permissions:
-  # Doing it explicitly because the default permission only includes metadata: read.
-  contents: read
+permissions: {}
 
 on:
   workflow_dispatch:
