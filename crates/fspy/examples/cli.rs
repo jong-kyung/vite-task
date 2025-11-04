@@ -1,4 +1,4 @@
-use std::{env::args_os, ffi::OsStr, io, path::PathBuf, pin::Pin};
+use std::{env::args_os, ffi::OsStr, path::PathBuf, pin::Pin};
 
 use fspy::{AccessMode, TrackedChild};
 use tokio::{
@@ -7,7 +7,7 @@ use tokio::{
 };
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     let mut args = args_os();
     let _ = args.next();
     assert_eq!(args.next().as_deref(), Some(OsStr::new("-o")));

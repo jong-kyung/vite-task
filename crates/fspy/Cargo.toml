@@ -16,6 +16,7 @@ libc = { workspace = true }
 ouroboros = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "process", "io-util", "sync"] }
 which = { workspace = true }
 xxhash-rust = { workspace = true }
@@ -40,6 +41,7 @@ winsafe = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 csv-async = { workspace = true }
 ctor = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-std"] }

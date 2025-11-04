@@ -1,14 +1,11 @@
 mod test_utils;
 
-use std::{
-    env::{current_dir, vars_os},
-    io,
-};
+use std::env::{current_dir, vars_os};
 
 use fspy::{AccessMode, PathAccessIterable, TrackedChild};
 use test_utils::assert_contains;
 
-async fn track_node_script(script: &str) -> io::Result<PathAccessIterable> {
+async fn track_node_script(script: &str) -> anyhow::Result<PathAccessIterable> {
     let mut command = fspy::Spy::global()?.new_command("node");
     command
         .arg("-e")
@@ -22,21 +19,21 @@ async fn track_node_script(script: &str) -> io::Result<PathAccessIterable> {
 }
 
 #[tokio::test]
-async fn read_sync() -> io::Result<()> {
+async fn read_sync() -> anyhow::Result<()> {
     let accesses = track_node_script("try { fs.readFileSync('hello') } catch {}").await?;
     assert_contains(&accesses, current_dir().unwrap().join("hello").as_path(), AccessMode::Read);
     Ok(())
 }
 
 #[tokio::test]
-async fn read_dir_sync() -> io::Result<()> {
+async fn read_dir_sync() -> anyhow::Result<()> {
     let accesses = track_node_script("try { fs.readdirSync('.') } catch {}").await?;
     assert_contains(&accesses, &current_dir().unwrap(), AccessMode::ReadDir);
     Ok(())
 }
 
 #[tokio::test]
-async fn subprocess() -> io::Result<()> {
+async fn subprocess() -> anyhow::Result<()> {
     let cmd = if cfg!(windows) {
         r"'cmd', ['/c', 'type hello']"
     } else {

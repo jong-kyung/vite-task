@@ -4,6 +4,8 @@
 // Persist the injected DLL/shared library somewhere in the filesystem.
 mod fixture;
 
+pub mod error;
+
 mod ipc;
 
 #[cfg(unix)]

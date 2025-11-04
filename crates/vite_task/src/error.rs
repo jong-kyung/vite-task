@@ -1,5 +1,6 @@
 use std::{ffi::OsString, io, path::Path, sync::Arc};
 
+use fspy::error::SpawnError;
 use petgraph::algo::Cycle;
 use vite_path::{
     AbsolutePath, RelativePathBuf,
@@ -104,6 +105,9 @@ pub enum Error {
     #[cfg(unix)]
     #[error(transparent)]
     Nix(#[from] nix::Error),
+
+    #[error("Failed to spawn task")]
+    SpawnError(#[from] SpawnError),
 }
 
 impl From<StripPrefixError<'_>> for Error {

@@ -3,7 +3,6 @@ mod test_utils;
 use std::{
     env::current_dir,
     fs::{File, OpenOptions},
-    io,
     path::Path,
     process::Stdio,
 };
@@ -12,7 +11,7 @@ use fspy::AccessMode;
 use test_utils::assert_contains;
 
 #[tokio::test]
-async fn open_read() -> io::Result<()> {
+async fn open_read() -> anyhow::Result<()> {
     let accesses = track_child!({
         File::open("hello");
     })
@@ -23,7 +22,7 @@ async fn open_read() -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn open_write() -> io::Result<()> {
+async fn open_write() -> anyhow::Result<()> {
     let accesses = track_child!({
         let path = format!("{}/hello", env!("CARGO_TARGET_TMPDIR"));
         OpenOptions::new().write(true).open(path);
@@ -39,7 +38,7 @@ async fn open_write() -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn readdir() -> io::Result<()> {
+async fn readdir() -> anyhow::Result<()> {
     let accesses = track_child!({
         let path = format!("{}/hello", env!("CARGO_TARGET_TMPDIR"));
         std::fs::read_dir(path);
@@ -55,7 +54,7 @@ async fn readdir() -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn subprocess() -> io::Result<()> {
+async fn subprocess() -> anyhow::Result<()> {
     let accesses = track_child!({
         let mut command = if cfg!(windows) {
             let mut command = std::process::Command::new("cmd");

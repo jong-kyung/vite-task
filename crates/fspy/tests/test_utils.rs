@@ -1,7 +1,4 @@
-use std::{
-    io,
-    path::{Path, PathBuf, StripPrefixError},
-};
+use std::path::{Path, PathBuf, StripPrefixError};
 
 use fspy::{AccessMode, PathAccessIterable, TrackedChild};
 
@@ -55,7 +52,7 @@ macro_rules! track_child {
     }};
 }
 
-pub async fn _spawn_with_id(id: &str) -> io::Result<PathAccessIterable> {
+pub async fn _spawn_with_id(id: &str) -> anyhow::Result<PathAccessIterable> {
     let mut command = fspy::Spy::global()?.new_command(::std::env::current_exe()?);
     command.arg(id);
     let TrackedChild { mut tokio_child, accesses_future } = command.spawn().await?;

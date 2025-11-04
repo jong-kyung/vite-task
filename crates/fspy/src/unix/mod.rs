@@ -24,6 +24,7 @@ use tokio::task::spawn_blocking;
 use crate::{
     Command, TrackedChild,
     arena::PathAccessArena,
+    error::SpawnError,
     ipc::{OwnedReceiverLockGuard, SHM_CAPACITY},
 };
 
@@ -82,11 +83,12 @@ impl PathAccessIterable {
     }
 }
 
-pub(crate) async fn spawn_impl(mut command: Command) -> io::Result<TrackedChild> {
+pub(crate) async fn spawn_impl(mut command: Command) -> Result<TrackedChild, SpawnError> {
     #[cfg(target_os = "linux")]
-    let supervisor = supervise::<SyscallHandler>()?;
+    let supervisor = supervise::<SyscallHandler>().map_err(SpawnError::SupervisorError)?;
 
-    let (ipc_channel_conf, ipc_receiver) = channel(SHM_CAPACITY)?;
+    let (ipc_channel_conf, ipc_receiver) =
+        channel(SHM_CAPACITY).map_err(SpawnError::ChannelCreationError)?;
 
     let payload = Payload {
         ipc_channel_conf,
@@ -111,7 +113,8 @@ pub(crate) async fn spawn_impl(mut command: Command) -> io::Result<TrackedChild>
         |path_access| {
             exec_resolve_accesses.add(path_access);
         },
-    )?;
+    )
+    .map_err(|err| SpawnError::InjectionError(err.into()))?;
     command.set_exec(exec);
 
     let mut tokio_command = command.into_tokio_command();
@@ -128,7 +131,10 @@ pub(crate) async fn spawn_impl(mut command: Command) -> io::Result<TrackedChild>
     // tokio_command.spawn blocks while executing the `pre_exec` closure.
     // Run it inside spawn_blocking to avoid blocking the tokio runtime, especially the supervisor loop,
     // which needs to accept incoming connections while `pre_exec` is connecting to it.
-    let child = spawn_blocking(move || tokio_command.spawn()).await??;
+    let child = spawn_blocking(move || tokio_command.spawn())
+        .await
+        .map_err(|err| SpawnError::OsSpawnError(err.into()))?
+        .map_err(SpawnError::OsSpawnError)?;
 
     let arenas_future = async move {
         let arenas = std::iter::once(exec_resolve_accesses);

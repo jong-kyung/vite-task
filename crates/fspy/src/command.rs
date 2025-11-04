@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
-    io,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -12,6 +11,7 @@ use tokio::process::Command as TokioCommand;
 
 use crate::{
     TrackedChild,
+    error::SpawnError,
     os_impl::{self, spawn_impl},
 };
 
@@ -145,13 +145,13 @@ impl Command {
         self
     }
 
-    pub async fn spawn(mut self) -> io::Result<TrackedChild> {
+    pub async fn spawn(mut self) -> Result<TrackedChild, SpawnError> {
         self.resolve_program()?;
         spawn_impl(self).await
     }
 
     /// Resolve program name to full path using `PATH` and cwd.
-    pub fn resolve_program(&mut self) -> io::Result<()> {
+    pub fn resolve_program(&mut self) -> Result<(), SpawnError> {
         let mut path_env: Option<&OsStr> = None;
         for (env_name, env_value) in &self.envs {
             let Some(env_name) = env_name.to_str() else {
@@ -163,13 +163,19 @@ impl Command {
             }
         }
 
-        self.program = which::which_in(
-            self.program.as_os_str(),
-            path_env,
-            if let Some(cwd) = &self.cwd { cwd.clone() } else { std::env::current_dir()? },
-        )
-        .map_err(|err| io::Error::new(io::ErrorKind::NotFound, err))?
-        .into_os_string();
+        let cwd = if let Some(cwd) = &self.cwd {
+            cwd.clone()
+        } else {
+            std::env::current_dir().expect("failed to get current dir")
+        };
+        self.program = which::which_in(self.program.as_os_str(), path_env, &cwd)
+            .map_err(|err| SpawnError::WhichError {
+                program: self.program.clone(),
+                path: path_env.map(OsStr::to_owned),
+                cwd,
+                cause: err,
+            })?
+            .into_os_string();
         Ok(())
     }
 
