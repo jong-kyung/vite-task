@@ -41,12 +41,12 @@ async fn track_test_bin(args: &[&str], cwd: Option<&str>) -> PathAccessIterable 
         cmd.current_dir(cwd);
     };
     cmd.args(args);
-    let mut tracked_child = cmd.spawn().await.unwrap();
+    let tracked_child = cmd.spawn().await.unwrap();
 
-    let output = tracked_child.tokio_child.wait().await.unwrap();
-    assert!(output.success());
+    let termination = tracked_child.wait_handle.await.unwrap();
+    assert!(termination.status.success());
 
-    tracked_child.accesses_future.await.unwrap()
+    termination.path_accesses
 }
 
 #[tokio::test]

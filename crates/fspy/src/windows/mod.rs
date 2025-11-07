@@ -21,7 +21,7 @@ use winsafe::co::{CP, WC};
 use xxhash_rust::const_xxh3::xxh3_128;
 
 use crate::{
-    TrackedChild,
+    ChildTermination, TrackedChild,
     command::Command,
     error::SpawnError,
     fixture::Fixture,
@@ -81,17 +81,9 @@ pub(crate) async fn spawn_impl(command: Command) -> Result<TrackedChild, SpawnEr
     let (channel_conf, receiver) =
         channel(SHM_CAPACITY).map_err(SpawnError::ChannelCreationError)?;
 
-    let accesses_future = async move {
-        let ipc_receiver_lock_guard = OwnedReceiverLockGuard::lock_async(receiver).await?;
-        io::Result::Ok(PathAccessIterable { ipc_receiver_lock_guard })
-    }
-    .boxed();
-
-    // let path_access_stream = PathAccessIterable { pipe_receiver };
-
     let mut spawn_success = false;
     let spawn_success = &mut spawn_success;
-    let child = command
+    let mut child = command
         .spawn_with(|std_command| {
             let std_child = std_command.spawn()?;
             *spawn_success = true;
@@ -138,5 +130,22 @@ pub(crate) async fn spawn_impl(command: Command) -> Result<TrackedChild, SpawnEr
             }
         })?;
 
-    Ok(TrackedChild { tokio_child: child, accesses_future })
+    Ok(TrackedChild {
+        stdin: child.stdin.take(),
+        stdout: child.stdout.take(),
+        stderr: child.stderr.take(),
+        // Keep polling for the child to exit in the background even if `wait_handle` is not awaited,
+        // because we need to stop the supervisor and lock the channel as soon as the child exits.
+        wait_handle: tokio::spawn(async move {
+            let status = child.wait().await?;
+            // Lock the ipc channel after the child has exited.
+            // We are not interested in path accesses from descendants after the main child has exited.
+            let ipc_receiver_lock_guard = OwnedReceiverLockGuard::lock_async(receiver).await?;
+            let path_accesses = PathAccessIterable { ipc_receiver_lock_guard };
+
+            io::Result::Ok(ChildTermination { status, path_accesses })
+        })
+        .map(|f| io::Result::Ok(f??)) // flatten JoinError and io::Result
+        .boxed(),
+    })
 }
