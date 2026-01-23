@@ -88,6 +88,7 @@ passfd = { git = "https://github.com/polachok/passfd", rev = "d55881752c16aced1a
 petgraph = "0.8.2"
 phf = { version = "0.11.3", features = ["macros"] }
 portable-pty = "0.9.0"
+pretty_assertions = "1.4.1"
 rand = "0.9.1"
 ratatui = "0.29.0"
 rayon = "1.10.0"
@@ -116,6 +117,7 @@ toml = "0.9.5"
 tracing = "0.1.43"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "serde"] }
+ts-rs = { version = "11.1.0" }
 tui-term = "0.2.0"
 twox-hash = "2.1.1"
 uuid = "1.18.1"

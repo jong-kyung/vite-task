@@ -23,7 +23,12 @@ vite_str = { workspace = true }
 vite_workspace = { workspace = true }
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+ts-rs = { workspace = true }
+vite_path = { workspace = true, features = ["ts-rs"] }
+vite_str = { workspace = true, features = ["ts-rs"] }
+which = { workspace = true }
 
 [lints]
 workspace = true
