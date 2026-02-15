@@ -2,19 +2,22 @@
 source: crates/vite_task_bin/tests/e2e_snapshots/main.rs
 expression: e2e_outputs
 ---
-[42]> vp run pkg-a#fail # exits with code 42
-~/packages/pkg-a$ node -e "process.exit(42)"
+> vp run check-tty
+$ check-tty ⊘ cache disabled: no cache config
+stdin:tty
+stdout:tty
+stderr:tty
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     Vite+ Task Runner • Execution Summary
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Statistics:   1 tasks • 0 cache hits • 1 cache misses • 1 failed
+Statistics:   1 tasks • 0 cache hits • 0 cache misses • 1 cache disabled
 Performance:  0% cache hit rate
 
 Task Details:
 ────────────────────────────────────────────────
-  [1] pkg-a#fail: ~/packages/pkg-a$ node -e "process.exit(42)" ✗ (exit code: 42)
-      → Cache miss: no previous cache entry found
+  [1] stdio-detection-test#check-tty: $ check-tty ✓
+      → Cache disabled in task configuration
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -2,12 +2,16 @@
 source: crates/vite_task_bin/tests/e2e_snapshots/main.rs
 expression: e2e_outputs
 ---
-> vp run task # cache miss
-$ print foo
-foo
+> vp run -r check-tty-cached
+~/packages/other$ check-tty
+stdin:not-tty
+stdout:not-tty
+stderr:not-tty
 
-$ print bar
-bar
+$ check-tty
+stdin:not-tty
+stdout:not-tty
+stderr:not-tty
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -19,53 +23,36 @@ Performance:  0% cache hit rate
 
 Task Details:
 ────────────────────────────────────────────────
-  [1] task: $ print foo ✓
+  [1] other#check-tty-cached: ~/packages/other$ check-tty ✓
       → Cache miss: no previous cache entry found
   ·······················································
-  [2] task: $ print bar ✓
+  [2] stdio-detection-test#check-tty-cached: $ check-tty ✓
       → Cache miss: no previous cache entry found
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-> json-edit package.json '_.scripts.task = "print baz && print bar"' # change first subtask
+> vp run -r check-tty-cached
+~/packages/other$ check-tty ✓ cache hit, replaying
+stdin:not-tty
+stdout:not-tty
+stderr:not-tty
 
-> vp run task # first: cache miss, second: cache hit
-$ print baz ✗ cache miss: args changed, executing
-baz
-
-$ print bar ✓ cache hit, replaying
-bar
+$ check-tty ✓ cache hit, replaying
+stdin:not-tty
+stdout:not-tty
+stderr:not-tty
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     Vite+ Task Runner • Execution Summary
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Statistics:   2 tasks • 1 cache hits • 1 cache misses
-Performance:  50% cache hit rate, <duration> saved in total
-
-Task Details:
-────────────────────────────────────────────────
-  [1] task: $ print baz ✓
-      → Cache miss: args changed
-  ·······················································
-  [2] task: $ print bar ✓
-      → Cache hit - output replayed - <duration> saved
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-> json-edit package.json '_.scripts.task = "print bar"' # remove first subtask
-
-> vp run task # cache hit
-$ print bar ✓ cache hit, replaying
-bar
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    Vite+ Task Runner • Execution Summary
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Statistics:   1 tasks • 1 cache hits • 0 cache misses
+Statistics:   2 tasks • 2 cache hits • 0 cache misses
 Performance:  100% cache hit rate, <duration> saved in total
 
 Task Details:
 ────────────────────────────────────────────────
-  [1] task: $ print bar ✓
+  [1] other#check-tty-cached: ~/packages/other$ check-tty ✓
+      → Cache hit - output replayed - <duration> saved
+  ·······················································
+  [2] stdio-detection-test#check-tty-cached: $ check-tty ✓
       → Cache hit - output replayed - <duration> saved
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
