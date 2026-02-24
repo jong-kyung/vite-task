@@ -7,7 +7,8 @@ use futures_util::FutureExt;
 use tokio::io::AsyncWriteExt as _;
 use vite_path::AbsolutePath;
 use vite_task_plan::{
-    ExecutionGraph, ExecutionItemKind, LeafExecutionKind, SpawnCommand, SpawnExecution,
+    ExecutionGraph, ExecutionItemDisplay, ExecutionItemKind, LeafExecutionKind, SpawnCommand,
+    SpawnExecution,
 };
 
 use self::{
@@ -21,8 +22,8 @@ use super::{
         ExecutionError,
     },
     reporter::{
-        ExitStatus, GraphExecutionReporter, GraphExecutionReporterBuilder, LeafExecutionPath,
-        LeafExecutionReporter, StdioSuggestion,
+        ExitStatus, GraphExecutionReporter, GraphExecutionReporterBuilder, LeafExecutionReporter,
+        StdioSuggestion,
     },
 };
 use crate::{Session, session::execute::spawn::SpawnTrackResult};
@@ -64,16 +65,18 @@ impl ExecutionContext<'_> {
     /// We compute a topological order and iterate in reverse to get execution order
     /// (dependencies before dependents).
     ///
-    /// The `path_prefix` tracks our position within nested execution graphs. For the
-    /// root call this is an empty path; for nested `Expanded` items it carries the
-    /// path so far.
+    /// `all_ancestors_single_node` tracks whether every graph in the ancestry chain
+    /// (from the root down to this level) contains exactly one node. The initial call
+    /// passes `graph.node_count() == 1`; recursive calls AND with the nested graph's
+    /// node count.
+    ///
     /// Leaf-level errors are reported through the reporter and do not abort the graph.
     /// Cycle detection is handled at plan time, so this function cannot encounter cycles.
     #[expect(clippy::future_not_send, reason = "uses !Send types internally")]
     async fn execute_expanded_graph(
         &mut self,
         graph: &ExecutionGraph,
-        path_prefix: &LeafExecutionPath,
+        all_ancestors_single_node: bool,
     ) {
         // `compute_topological_order()` returns nodes in topological order: for every
         // edge A→B, A appears before B. Since our edges mean "A depends on B",
@@ -86,18 +89,24 @@ impl ExecutionContext<'_> {
         for &node_ix in topo_order.iter().rev() {
             let task_execution = &graph[node_ix];
 
-            for (item_idx, item) in task_execution.items.iter().enumerate() {
-                // Build the path for this item by appending to the prefix
-                let mut item_path = path_prefix.clone();
-                item_path.push(node_ix, item_idx);
-
+            for item in &task_execution.items {
                 match &item.kind {
                     ExecutionItemKind::Leaf(leaf_kind) => {
-                        self.execute_leaf(&item_path, leaf_kind).boxed_local().await;
+                        self.execute_leaf(
+                            &item.execution_item_display,
+                            leaf_kind,
+                            all_ancestors_single_node,
+                        )
+                        .boxed_local()
+                        .await;
                     }
                     ExecutionItemKind::Expanded(nested_graph) => {
-                        // Recurse into the nested graph, carrying the path prefix forward.
-                        self.execute_expanded_graph(nested_graph, &item_path).boxed_local().await;
+                        self.execute_expanded_graph(
+                            nested_graph,
+                            all_ancestors_single_node && nested_graph.node_count() == 1,
+                        )
+                        .boxed_local()
+                        .await;
                     }
                 }
             }
@@ -111,12 +120,14 @@ impl ExecutionContext<'_> {
     #[expect(clippy::future_not_send, reason = "uses !Send types internally")]
     async fn execute_leaf(
         &mut self,
-        path: &LeafExecutionPath,
-        leaf_execution_kind: &LeafExecutionKind,
+        display: &ExecutionItemDisplay,
+        leaf_kind: &LeafExecutionKind,
+        all_ancestors_single_node: bool,
     ) {
-        let mut leaf_reporter = self.reporter.new_leaf_execution(path);
+        let mut leaf_reporter =
+            self.reporter.new_leaf_execution(display, leaf_kind, all_ancestors_single_node);
 
-        match leaf_execution_kind {
+        match leaf_kind {
             LeafExecutionKind::InProcess(in_process_execution) => {
                 // In-process (built-in) commands: caching is disabled, execute synchronously
                 let mut stdio_config = leaf_reporter
@@ -401,10 +412,7 @@ impl Session<'_> {
             }
         };
 
-        // Wrap the graph in Arc so both the reporter and execution can reference it.
-        // The reporter clones the Arc internally for display lookups.
-        let graph = Arc::new(execution_graph);
-        let mut reporter = builder.build(&graph);
+        let mut reporter = builder.build();
 
         let mut execution_context = ExecutionContext {
             reporter: &mut *reporter,
@@ -414,7 +422,8 @@ impl Session<'_> {
 
         // Execute the graph. Leaf-level errors are reported through the reporter
         // and do not abort the graph. Cycle detection is handled at plan time.
-        execution_context.execute_expanded_graph(&graph, &LeafExecutionPath::default()).await;
+        let all_single_node = execution_graph.node_count() == 1;
+        execution_context.execute_expanded_graph(&execution_graph, all_single_node).await;
 
         // Leaf-level errors and non-zero exit statuses are tracked internally
         // by the reporter.
