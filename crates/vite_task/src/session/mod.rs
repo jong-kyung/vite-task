@@ -10,7 +10,10 @@ use cache::ExecutionCache;
 pub use cache::{CacheMiss, FingerprintMismatch};
 use once_cell::sync::OnceCell;
 pub use reporter::ExitStatus;
-use reporter::LabeledReporterBuilder;
+use reporter::{
+    LabeledReporterBuilder,
+    summary::{LastRunSummary, ReadSummaryError, format_full_summary},
+};
 use rustc_hash::FxHashMap;
 use vite_path::{AbsolutePath, AbsolutePathBuf};
 use vite_select::SelectItem;
@@ -26,7 +29,7 @@ use vite_task_plan::{
 };
 use vite_workspace::{WorkspaceRoot, find_workspace_root};
 
-use crate::cli::{CacheSubcommand, Command, RunCommand, RunFlags};
+use crate::cli::{CacheSubcommand, Command, ResolvedCommand, RunCommand, RunFlags};
 
 #[derive(Debug)]
 enum LazyTaskGraph<'a> {
@@ -97,11 +100,13 @@ impl vite_task_plan::PlanRequestParser for PlanRequestParser<'_> {
     ) -> anyhow::Result<Option<PlanRequest>> {
         match self.command_handler.handle_command(command).await? {
             HandledCommand::Synthesized(synthetic) => Ok(Some(PlanRequest::Synthetic(synthetic))),
-            HandledCommand::ViteTaskCommand(cli_command) => match cli_command {
-                Command::Cache { .. } => Ok(Some(PlanRequest::Synthetic(
-                    command.to_synthetic_plan_request(UserCacheConfig::disabled()),
-                ))),
-                Command::Run(run_command) => {
+            HandledCommand::ViteTaskCommand(cli_command) => match cli_command.into_resolved() {
+                ResolvedCommand::Cache { .. } | ResolvedCommand::RunLastDetails => {
+                    Ok(Some(PlanRequest::Synthetic(
+                        command.to_synthetic_plan_request(UserCacheConfig::disabled()),
+                    )))
+                }
+                ResolvedCommand::Run(run_command) => {
                     match run_command.into_query_plan_request(&command.cwd) {
                         Ok(query_plan_request) => Ok(Some(PlanRequest::Query(query_plan_request))),
                         Err(crate::cli::CLITaskQueryError::MissingTaskSpecifier) => {
@@ -222,19 +227,21 @@ impl<'a> Session<'a> {
         reason = "session is single-threaded, futures do not need to be Send"
     )]
     pub async fn main(mut self, command: Command) -> anyhow::Result<ExitStatus> {
-        match command {
-            Command::Cache { ref subcmd } => self.handle_cache_command(subcmd),
-            Command::Run(run_command) => {
+        match command.into_resolved() {
+            ResolvedCommand::Cache { ref subcmd } => self.handle_cache_command(subcmd),
+            ResolvedCommand::RunLastDetails => self.show_last_run_details(),
+            ResolvedCommand::Run(run_command) => {
                 let cwd = Arc::clone(&self.cwd);
                 let is_interactive =
                     std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
                 // Save task name and flags before consuming run_command
                 let task_name = run_command.task_specifier.as_ref().map(|s| s.task_name.clone());
+                let show_details = run_command.flags.verbose;
                 let flags = run_command.flags;
                 let additional_args = run_command.additional_args.clone();
 
-                match self.plan_from_cli_run(cwd, run_command).await {
+                match self.plan_from_cli_run_resolved(cwd, run_command).await {
                     Ok(ref graph) if graph.node_count() == 0 => {
                         // No tasks matched the query — show task selector / "did you mean"
                         self.handle_no_task(
@@ -249,6 +256,8 @@ impl<'a> Session<'a> {
                         let builder = LabeledReporterBuilder::new(
                             self.workspace_path(),
                             Box::new(tokio::io::stdout()),
+                            show_details,
+                            Some(self.make_summary_writer()),
                         );
                         Ok(self
                             .execute_graph(graph, Box::new(builder))
@@ -389,13 +398,22 @@ impl<'a> Session<'a> {
         // Interactive: run the selected task
         let selected_label = &select_items[selected_index].label;
         let task_specifier = TaskSpecifier::parse_raw(selected_label);
-        let run_command =
-            RunCommand { task_specifier: Some(task_specifier), flags, additional_args };
+        let show_details = flags.verbose;
+        let run_command = RunCommand {
+            task_specifier: Some(task_specifier),
+            flags,
+            additional_args,
+            last_details: false,
+        };
 
         let cwd = Arc::clone(&self.cwd);
         let graph = self.plan_from_cli_run(cwd, run_command).await?;
-        let builder =
-            LabeledReporterBuilder::new(self.workspace_path(), Box::new(tokio::io::stdout()));
+        let builder = LabeledReporterBuilder::new(
+            self.workspace_path(),
+            Box::new(tokio::io::stdout()),
+            show_details,
+            Some(self.make_summary_writer()),
+        );
         Ok(self.execute_graph(graph, Box::new(builder)).await.err().unwrap_or(ExitStatus::SUCCESS))
     }
 
@@ -412,6 +430,57 @@ impl<'a> Session<'a> {
 
     pub fn workspace_path(&self) -> Arc<AbsolutePath> {
         Arc::clone(&self.workspace_path)
+    }
+
+    /// Path to the `last-summary.json` file inside the cache directory.
+    fn summary_file_path(&self) -> AbsolutePathBuf {
+        self.cache_path.join("last-summary.json")
+    }
+
+    /// Create a callback that persists the summary to `last-summary.json`.
+    ///
+    /// The returned closure captures the file path and handles errors internally
+    /// (logging failures without propagating).
+    fn make_summary_writer(&self) -> Box<dyn FnOnce(&LastRunSummary)> {
+        let path = self.summary_file_path();
+        Box::new(move |summary: &LastRunSummary| {
+            if let Err(err) = summary.write_atomic(&path) {
+                tracing::warn!("Failed to write summary to {path:?}: {err}");
+            }
+        })
+    }
+
+    /// Display the saved summary from the last run (`--last-details`).
+    #[expect(
+        clippy::print_stderr,
+        reason = "--last-details error messages are user-facing diagnostics, not debug output"
+    )]
+    fn show_last_run_details(&self) -> anyhow::Result<ExitStatus> {
+        let path = self.summary_file_path();
+        match LastRunSummary::read_from_path(&path) {
+            Ok(Some(summary)) => {
+                let buf = format_full_summary(&summary);
+                {
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(&buf)?;
+                    stdout.flush()?;
+                }
+                Ok(ExitStatus(summary.exit_code))
+            }
+            Ok(None) => {
+                eprintln!("No previous run summary found. Run a task first to generate a summary.");
+                Ok(ExitStatus::FAILURE)
+            }
+            Err(ReadSummaryError::IncompatibleVersion) => {
+                eprintln!(
+                    "Summary data was saved by a different version of vite-task and cannot be read. \
+                     Run a task to generate a new summary."
+                );
+                Ok(ExitStatus::FAILURE)
+            }
+            Err(ReadSummaryError::Io(err)) => Err(err.into()),
+        }
     }
 
     pub const fn task_graph(&self) -> Option<&TaskGraph> {
@@ -514,6 +583,19 @@ impl<'a> Session<'a> {
         &mut self,
         cwd: Arc<AbsolutePath>,
         command: RunCommand,
+    ) -> Result<ExecutionGraph, vite_task_plan::Error> {
+        self.plan_from_cli_run_resolved(cwd, command.into_resolved()).await
+    }
+
+    /// Internal: plans execution from a resolved run command.
+    #[expect(
+        clippy::future_not_send,
+        reason = "session is single-threaded, futures do not need to be Send"
+    )]
+    async fn plan_from_cli_run_resolved(
+        &mut self,
+        cwd: Arc<AbsolutePath>,
+        command: crate::cli::ResolvedRunCommand,
     ) -> Result<ExecutionGraph, vite_task_plan::Error> {
         let query_plan_request = match command.into_query_plan_request(&cwd) {
             Ok(query_plan_request) => query_plan_request,

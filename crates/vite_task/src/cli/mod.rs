@@ -17,6 +17,7 @@ pub enum CacheSubcommand {
 /// Extracted as a separate struct so they can be cheaply `Copy`-ed
 /// before `RunCommand` is consumed.
 #[derive(Debug, Clone, Copy, clap::Args)]
+#[expect(clippy::struct_excessive_bools, reason = "CLI flags are naturally boolean")]
 pub struct RunFlags {
     /// Run tasks found in all packages in the workspace, in topological order based on package dependencies.
     #[clap(default_value = "false", short, long)]
@@ -29,23 +30,43 @@ pub struct RunFlags {
     /// Do not run dependencies specified in `dependsOn` fields.
     #[clap(default_value = "false", long)]
     pub ignore_depends_on: bool,
+
+    /// Show full detailed summary after execution.
+    #[clap(default_value = "false", short = 'v', long)]
+    pub verbose: bool,
 }
 
-/// Arguments for the `run` subcommand.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Public CLI types (clap-parsed)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Arguments for the `run` subcommand as parsed by clap.
+///
+/// Contains the `--last-details` flag which is resolved into a separate
+/// `ResolvedCommand::RunLastDetails` variant internally.
 #[derive(Debug, clap::Args)]
 pub struct RunCommand {
     /// `packageName#taskName` or `taskName`. If omitted, lists all available tasks.
-    pub task_specifier: Option<TaskSpecifier>,
+    pub(crate) task_specifier: Option<TaskSpecifier>,
 
     #[clap(flatten)]
-    pub flags: RunFlags,
+    pub(crate) flags: RunFlags,
 
     /// Additional arguments to pass to the tasks
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub additional_args: Vec<Str>,
+    pub(crate) additional_args: Vec<Str>,
+
+    /// Display the detailed summary of the last run.
+    #[clap(long, exclusive = true)]
+    pub(crate) last_details: bool,
 }
 
-/// vite task CLI subcommands
+/// vite task CLI subcommands as parsed by clap.
+///
+/// vite task CLI subcommands as parsed by clap.
+///
+/// Pass directly to `Session::main` or `HandledCommand::ViteTaskCommand`.
+/// The `--last-details` flag on the `run` subcommand is resolved internally.
 #[derive(Debug, Parser)]
 pub enum Command {
     /// Run tasks
@@ -55,6 +76,68 @@ pub enum Command {
         #[clap(subcommand)]
         subcmd: CacheSubcommand,
     },
+}
+
+impl Command {
+    /// Resolve the clap-parsed command into the dispatched [`ResolvedCommand`] enum.
+    ///
+    /// When `--last-details` is set on the `run` subcommand, this produces
+    /// [`ResolvedCommand::RunLastDetails`] instead of [`ResolvedCommand::Run`],
+    /// making the exclusivity enforced at the type level.
+    #[must_use]
+    pub(crate) fn into_resolved(self) -> ResolvedCommand {
+        match self {
+            Self::Run(run) if run.last_details => ResolvedCommand::RunLastDetails,
+            Self::Run(run) => ResolvedCommand::Run(run.into_resolved()),
+            Self::Cache { subcmd } => ResolvedCommand::Cache { subcmd },
+        }
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Internal resolved types (used for dispatch — `--last-details` is a separate variant)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Resolved CLI command for internal dispatch.
+///
+/// Unlike [`Command`], this enum makes `--last-details` a separate variant
+/// ([`ResolvedCommand::RunLastDetails`]) so that it is exclusive at the type level —
+/// there is no way to combine it with task execution fields.
+#[derive(Debug)]
+pub enum ResolvedCommand {
+    /// Run tasks with the given parameters.
+    Run(ResolvedRunCommand),
+    /// Display the saved detailed summary of the last run (`--last-details`).
+    RunLastDetails,
+    /// Manage the task cache.
+    Cache { subcmd: CacheSubcommand },
+}
+
+/// Resolved arguments for executing tasks.
+///
+/// Does not contain `last_details` — that case is represented by
+/// [`ResolvedCommand::RunLastDetails`] instead.
+#[derive(Debug)]
+pub struct ResolvedRunCommand {
+    /// `packageName#taskName` or `taskName`. If omitted, lists all available tasks.
+    pub task_specifier: Option<TaskSpecifier>,
+
+    pub flags: RunFlags,
+
+    /// Additional arguments to pass to the tasks.
+    pub additional_args: Vec<Str>,
+}
+
+impl RunCommand {
+    /// Convert to the resolved run command, stripping the `last_details` flag.
+    #[must_use]
+    pub(crate) fn into_resolved(self) -> ResolvedRunCommand {
+        ResolvedRunCommand {
+            task_specifier: self.task_specifier,
+            flags: self.flags,
+            additional_args: self.additional_args,
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -69,7 +152,7 @@ pub enum CLITaskQueryError {
     PackageNameSpecifiedWithRecursive { package_name: Str, task_name: Str },
 }
 
-impl RunCommand {
+impl ResolvedRunCommand {
     /// Convert to `QueryPlanRequest`, or return an error if invalid.
     ///
     /// # Errors
@@ -82,7 +165,7 @@ impl RunCommand {
     ) -> Result<QueryPlanRequest, CLITaskQueryError> {
         let Self {
             task_specifier,
-            flags: RunFlags { recursive, transitive, ignore_depends_on },
+            flags: RunFlags { recursive, transitive, ignore_depends_on, .. },
             additional_args,
         } = self;
 

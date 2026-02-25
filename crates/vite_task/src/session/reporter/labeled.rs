@@ -6,44 +6,27 @@
 //! Tracks statistics across multiple leaf executions, prints command lines with cache
 //! status indicators, and renders a summary with per-task details at the end.
 
-use std::{cell::RefCell, process::ExitStatus as StdExitStatus, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::RefCell, process::ExitStatus as StdExitStatus, rc::Rc, sync::Arc};
 
-use owo_colors::Style;
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use vite_path::AbsolutePath;
 use vite_str::Str;
 use vite_task_plan::{ExecutionItemDisplay, LeafExecutionKind};
 
 use super::{
-    CACHE_MISS_STYLE, COMMAND_STYLE, ColorizeExt, ExitStatus, GraphExecutionReporter,
-    GraphExecutionReporterBuilder, LeafExecutionReporter, StdioConfig, StdioSuggestion,
-    format_command_display, format_command_with_cache_status, format_error_message,
+    ExitStatus, GraphExecutionReporter, GraphExecutionReporterBuilder, LeafExecutionReporter,
+    StdioConfig, StdioSuggestion, format_command_with_cache_status, format_error_message,
 };
 use crate::session::{
-    cache::format_cache_status_summary,
-    event::{CacheStatus, CacheUpdateStatus, ExecutionError, exit_status_to_code},
+    event::{CacheStatus, CacheUpdateStatus, ExecutionError},
+    reporter::summary::{
+        LastRunSummary, SavedExecutionError, SpawnOutcome, TaskResult, TaskSummary,
+        format_compact_summary, format_full_summary,
+    },
 };
 
-/// Information tracked for each leaf execution, used in the final summary.
-#[derive(Debug)]
-struct ExecutionInfo {
-    display: ExecutionItemDisplay,
-    /// Cache status, determined at `start()`.
-    cache_status: CacheStatus,
-    /// Exit status from the process. `None` means no process was spawned (cache hit or in-process).
-    exit_status: Option<StdExitStatus>,
-    /// Error message, set on error.
-    error_message: Option<Str>,
-}
-
-/// Running statistics updated as leaf executions complete.
-#[derive(Default)]
-struct ExecutionStats {
-    cache_hits: usize,
-    cache_misses: usize,
-    cache_disabled: usize,
-    failed: usize,
-}
+/// Callback type for persisting the summary (e.g., writing `last-summary.json`).
+type WriteSummaryFn = Box<dyn FnOnce(&LastRunSummary)>;
 
 /// Mutable state shared between [`LabeledGraphReporter`] and its [`LabeledLeafReporter`] instances
 /// via `Rc<RefCell<...>>`.
@@ -51,8 +34,7 @@ struct ExecutionStats {
 /// This is safe because execution is single-threaded and sequential — only one leaf
 /// reporter is active at a time.
 struct SharedReporterState {
-    executions: Vec<ExecutionInfo>,
-    stats: ExecutionStats,
+    tasks: Vec<TaskSummary>,
 }
 
 /// Builder for the labeled graph reporter.
@@ -62,18 +44,21 @@ struct SharedReporterState {
 ///
 /// # Output Modes
 ///
-/// ## Normal Mode (default)
-/// - Prints command lines with cache status indicators during execution
-/// - Shows full summary with Statistics and Task Details at the end
+/// ## Compact Summary (default)
+/// - Single task + not cache hit → no summary at all
+/// - Single task + cache hit → thin line + "[vp run] cache hit, {duration} saved."
+/// - Multi-task → thin line + one-liner with stats
 ///
-/// ## Simplified Summary for Single Tasks
-/// - When a single task with display info is executed:
-///   - Skips full summary (no Statistics/Task Details sections)
-///   - Shows only cache status inline
-///   - Results in clean output showing just the command's stdout/stderr
+/// ## Full Summary (`--verbose`)
+/// - Shows full Statistics, Performance, and Task Details sections
 pub struct LabeledReporterBuilder {
     workspace_path: Arc<AbsolutePath>,
     writer: Box<dyn AsyncWrite + Unpin>,
+    /// Whether to render the full detailed summary (`--verbose` flag).
+    show_details: bool,
+    /// Callback to persist the summary (e.g., write `last-summary.json`).
+    /// `None` when persistence is not needed (e.g., nested script execution, tests).
+    write_summary: Option<WriteSummaryFn>,
 }
 
 impl LabeledReporterBuilder {
@@ -81,8 +66,15 @@ impl LabeledReporterBuilder {
     ///
     /// - `workspace_path`: The workspace root, used to compute relative cwds in display.
     /// - `writer`: Async writer for reporter display output.
-    pub fn new(workspace_path: Arc<AbsolutePath>, writer: Box<dyn AsyncWrite + Unpin>) -> Self {
-        Self { workspace_path, writer }
+    /// - `show_details`: Whether to render the full detailed summary.
+    /// - `write_summary`: Callback to persist the summary, or `None` to skip.
+    pub fn new(
+        workspace_path: Arc<AbsolutePath>,
+        writer: Box<dyn AsyncWrite + Unpin>,
+        show_details: bool,
+        write_summary: Option<WriteSummaryFn>,
+    ) -> Self {
+        Self { workspace_path, writer, show_details, write_summary }
     }
 }
 
@@ -90,12 +82,11 @@ impl GraphExecutionReporterBuilder for LabeledReporterBuilder {
     fn build(self: Box<Self>) -> Box<dyn GraphExecutionReporter> {
         let writer = Rc::new(RefCell::new(self.writer));
         Box::new(LabeledGraphReporter {
-            shared: Rc::new(RefCell::new(SharedReporterState {
-                executions: Vec::new(),
-                stats: ExecutionStats::default(),
-            })),
+            shared: Rc::new(RefCell::new(SharedReporterState { tasks: Vec::new() })),
             writer,
             workspace_path: self.workspace_path,
+            show_details: self.show_details,
+            write_summary: self.write_summary,
         })
     }
 }
@@ -108,6 +99,8 @@ pub struct LabeledGraphReporter {
     shared: Rc<RefCell<SharedReporterState>>,
     writer: Rc<RefCell<Box<dyn AsyncWrite + Unpin>>>,
     workspace_path: Arc<AbsolutePath>,
+    show_details: bool,
+    write_summary: Option<WriteSummaryFn>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -135,60 +128,72 @@ impl GraphExecutionReporter for LabeledGraphReporter {
             display,
             workspace_path: Arc::clone(&self.workspace_path),
             stdio_suggestion,
-            started: false,
+            cache_status: None,
         })
     }
 
     async fn finish(self: Box<Self>) -> Result<(), ExitStatus> {
-        // Borrow shared state synchronously to build the summary buffer and compute
-        // the exit result. The borrow is dropped before any async writes.
-        let (summary_buf, result) = {
-            let shared = self.shared.borrow();
-
-            let summary_buf =
-                format_summary(&shared.executions, &shared.stats, &self.workspace_path);
-
-            // Determine exit code based on failed tasks and infrastructure errors:
-            // - Infrastructure errors (cache lookup, spawn failure) have error_message set
-            //   but no meaningful exit_status.
-            // - Process failures have a non-zero exit_status.
-            //
-            // Rules:
-            // 1. No failures at all → Ok(())
-            // 2. Exactly one process failure, no infra errors → use that task's exit code
-            // 3. Any infra errors, or multiple failures → Err(1)
-            let has_infra_errors =
-                shared.executions.iter().any(|exec| exec.error_message.is_some());
-
-            let failed_exit_codes: Vec<i32> = shared
-                .executions
-                .iter()
-                .filter_map(|exec| exec.exit_status.as_ref())
-                .filter(|status| !status.success())
-                .map(|status| exit_status_to_code(*status))
-                .collect();
-
-            let result = match (has_infra_errors, failed_exit_codes.as_slice()) {
-                (false, []) => Ok(()),
-                (false, [code]) => {
-                    // Return the single failed task's exit code (clamped to u8 range)
-                    #[expect(
-                        clippy::cast_sign_loss,
-                        reason = "value is clamped to 1..=255, always positive"
-                    )]
-                    Err(ExitStatus((*code).clamp(1, 255) as u8))
-                }
-                _ => Err(ExitStatus::FAILURE),
-            };
-
-            (summary_buf, result)
+        // Take tasks from shared state — all leaf reporters have been dropped by now.
+        let tasks = {
+            let mut shared = self.shared.borrow_mut();
+            std::mem::take(&mut shared.tasks)
         };
-        // shared borrow dropped here
 
-        // Write the summary buffer asynchronously
+        // Compute exit status from the collected task results.
+        let has_infra_errors = tasks.iter().any(|t| t.result.error().is_some());
+
+        let failed_exit_codes: Vec<i32> = tasks
+            .iter()
+            .filter_map(|t| match &t.result {
+                TaskResult::Spawned { outcome: SpawnOutcome::Failed { exit_code }, .. } => {
+                    Some(exit_code.get())
+                }
+                _ => None,
+            })
+            .collect();
+
+        let result = match (has_infra_errors, failed_exit_codes.as_slice()) {
+            (false, []) => Ok(()),
+            (false, [code]) =>
+            {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "value is clamped to 1..=255, always positive"
+                )]
+                Err(ExitStatus((*code).clamp(1, 255) as u8))
+            }
+            _ => Err(ExitStatus::FAILURE),
+        };
+
+        let exit_code = match &result {
+            Ok(()) => 0u8,
+            Err(status) => status.0,
+        };
+
+        // Build summary from collected tasks.
+        let summary = LastRunSummary { tasks, exit_code };
+
+        // Render summary based on mode.
+        let summary_buf = if self.show_details {
+            format_full_summary(&summary)
+        } else {
+            format_compact_summary(&summary)
+        };
+
+        // Persist summary via callback (best-effort, callback handles errors).
+        if let Some(write_summary) = self.write_summary {
+            write_summary(&summary);
+        }
+
+        // Write the summary buffer asynchronously.
+        // Always flush the writer — even when the summary is empty, a preceding
+        // spawned process may have written to the same fd via Stdio::inherit()
+        // and the data must be flushed before the caller reads the output.
         {
             let mut writer = self.writer.borrow_mut();
-            let _ = writer.write_all(&summary_buf).await;
+            if !summary_buf.is_empty() {
+                let _ = writer.write_all(&summary_buf).await;
+            }
             let _ = writer.flush().await;
         }
 
@@ -198,8 +203,8 @@ impl GraphExecutionReporter for LabeledGraphReporter {
 
 /// Leaf-level reporter created by [`LabeledGraphReporter::new_leaf_execution`].
 ///
-/// Writes display output in real-time to the shared async writer and updates shared
-/// stats/errors via `Rc<RefCell<SharedReporterState>>`.
+/// Writes display output in real-time to the shared async writer and builds
+/// [`TaskSummary`] entries that are pushed to [`SharedReporterState`] on completion.
 struct LabeledLeafReporter {
     shared: Rc<RefCell<SharedReporterState>>,
     writer: Rc<RefCell<Box<dyn AsyncWrite + Unpin>>>,
@@ -208,9 +213,9 @@ struct LabeledLeafReporter {
     workspace_path: Arc<AbsolutePath>,
     /// Stdio suggestion precomputed from this leaf's graph path.
     stdio_suggestion: StdioSuggestion,
-    /// Whether `start()` has been called. Used to determine if stats should be updated
-    /// in `finish()` and whether to push an `ExecutionInfo` entry.
-    started: bool,
+    /// Cache status, set at `start()` time. `None` means `start()` was never called
+    /// (e.g., cache lookup failure). Consumed in `finish()` to build [`TaskSummary`].
+    cache_status: Option<CacheStatus>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -221,36 +226,12 @@ struct LabeledLeafReporter {
 )]
 impl LeafExecutionReporter for LabeledLeafReporter {
     async fn start(&mut self, cache_status: CacheStatus) -> StdioConfig {
-        self.started = true;
+        // Format command line with cache status before storing it.
+        let line =
+            format_command_with_cache_status(&self.display, &self.workspace_path, &cache_status);
 
-        // Update shared state synchronously, then drop the borrow before any async writes.
-        {
-            let mut shared = self.shared.borrow_mut();
+        self.cache_status = Some(cache_status);
 
-            // Update statistics based on cache status
-            match &cache_status {
-                CacheStatus::Hit { .. } => shared.stats.cache_hits += 1,
-                CacheStatus::Miss(_) => shared.stats.cache_misses += 1,
-                CacheStatus::Disabled(_) => shared.stats.cache_disabled += 1,
-            }
-
-            // Store execution info for the summary
-            shared.executions.push(ExecutionInfo {
-                display: self.display.clone(),
-                cache_status,
-                exit_status: None,
-                error_message: None,
-            });
-        }
-        // shared borrow dropped here
-
-        // Format command line with cache status (sync), then write asynchronously.
-        // The shared borrow to read cache_status is brief and dropped before the await.
-        let line = {
-            let shared = self.shared.borrow();
-            let cache_status = &shared.executions.last().unwrap().cache_status;
-            format_command_with_cache_status(&self.display, &self.workspace_path, cache_status)
-        };
         let mut writer = self.writer.borrow_mut();
         let _ = writer.write_all(line.as_bytes()).await;
         let _ = writer.flush().await;
@@ -268,285 +249,54 @@ impl LeafExecutionReporter for LabeledLeafReporter {
         _cache_update_status: CacheUpdateStatus,
         error: Option<ExecutionError>,
     ) {
-        // Format error message up front (before borrowing shared state)
-        let error_message: Option<Str> =
+        // Convert error before consuming it (need the original for display formatting).
+        let saved_error = error.as_ref().map(SavedExecutionError::from_execution_error);
+        let error_display: Option<Str> =
             error.map(|e| vite_str::format!("{:#}", anyhow::Error::from(e)));
-        let has_error = error_message.is_some();
 
-        // Update shared state synchronously, then drop the borrow before any async writes.
-        {
-            let mut shared = self.shared.borrow_mut();
+        // Destructure self to avoid partial-move issues with Box<Self>.
+        let Self { shared, writer, display, workspace_path, cache_status, .. } = *self;
+        let started = cache_status.is_some();
 
-            // Handle errors — update execution info and stats.
-            // Error message is formatted using anyhow's `{:#}` formatter
-            // (joins cause chain with `: ` separators).
-            if let Some(ref message) = error_message {
-                // Update the execution info if start() was called (an entry was pushed).
-                // Without the `self.started` guard, `last_mut()` would return a
-                // *different* execution's entry, corrupting its error_message.
-                if self.started
-                    && let Some(exec) = shared.executions.last_mut()
-                {
-                    exec.error_message = Some(message.clone());
-                }
+        // Build TaskSummary and push to shared state if start() was called.
+        if let Some(cache_status) = cache_status {
+            let cwd_relative = if let Ok(Some(rel)) = display.cwd.strip_prefix(&workspace_path) {
+                Str::from(rel.as_str())
+            } else {
+                Str::default()
+            };
 
-                shared.stats.failed += 1;
-            }
+            let task_summary = TaskSummary {
+                package_name: display.task_display.package_name.clone(),
+                task_name: display.task_display.task_name.clone(),
+                command: display.command.clone(),
+                cwd: cwd_relative,
+                result: TaskResult::from_execution(&cache_status, status, saved_error.as_ref()),
+            };
 
-            // Update failure statistics for non-zero exit status (not an error, just a failed task)
-            // None means success (cache hit or in-process), Some checks the actual exit status
-            if !has_error && status.is_some_and(|s| !s.success()) {
-                shared.stats.failed += 1;
-            }
-
-            // Update execution info with exit status (if start() was called and an entry exists)
-            if self.started
-                && let Some(exec) = shared.executions.last_mut()
-            {
-                exec.exit_status = status;
-            }
+            shared.borrow_mut().tasks.push(task_summary);
         }
-        // shared borrow dropped here
 
-        // Build all display output into a buffer (sync), then write once asynchronously.
+        // Build all display output into a buffer, then write once asynchronously.
         let mut buf = Vec::new();
 
-        if let Some(ref message) = error_message {
+        if let Some(ref message) = error_display {
             buf.extend_from_slice(format_error_message(message).as_bytes());
         }
 
         // Add a trailing newline after each task's output for readability.
         // Skip if start() was never called (e.g. cache lookup failure) — there's
         // no task output to separate.
-        if self.started {
+        if started {
             buf.push(b'\n');
         }
 
         if !buf.is_empty() {
-            let mut writer = self.writer.borrow_mut();
+            let mut writer = writer.borrow_mut();
             let _ = writer.write_all(&buf).await;
             let _ = writer.flush().await;
         }
     }
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Summary printing
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-/// Format the full execution summary into a byte buffer.
-///
-/// Called by [`LabeledGraphReporter::finish`] after all tasks have executed.
-/// The caller writes the returned buffer to the async writer.
-///
-/// Building the summary synchronously into a `Vec<u8>` buffer avoids holding
-/// `RefCell` borrows across async write points, and ensures atomic output.
-#[expect(
-    clippy::too_many_lines,
-    reason = "summary formatting is inherently verbose with many write calls"
-)]
-fn format_summary(
-    executions: &[ExecutionInfo],
-    stats: &ExecutionStats,
-    workspace_path: &AbsolutePath,
-) -> Vec<u8> {
-    use std::io::Write;
-    let mut buf = Vec::new();
-
-    let total = executions.len();
-    let cache_hits = stats.cache_hits;
-    let cache_misses = stats.cache_misses;
-    let cache_disabled = stats.cache_disabled;
-    let failed = stats.failed;
-
-    // Print summary header with decorative line
-    // Note: leaf finish already adds a trailing newline after each task's output
-    // Add an extra blank line before the summary for visual separation
-    let _ = writeln!(buf);
-    let _ = writeln!(
-        buf,
-        "{}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".style(Style::new().bright_black())
-    );
-    let _ = writeln!(
-        buf,
-        "{}",
-        "    Vite+ Task Runner • Execution Summary".style(Style::new().bold().bright_white())
-    );
-    let _ = writeln!(
-        buf,
-        "{}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".style(Style::new().bright_black())
-    );
-    let _ = writeln!(buf);
-
-    // Print statistics
-    let cache_disabled_str = if cache_disabled > 0 {
-        Str::from(
-            vite_str::format!("• {cache_disabled} cache disabled")
-                .style(Style::new().bright_black())
-                .to_string(),
-        )
-    } else {
-        Str::default()
-    };
-
-    let failed_str = if failed > 0 {
-        Str::from(vite_str::format!("• {failed} failed").style(Style::new().red()).to_string())
-    } else {
-        Str::default()
-    };
-
-    // Build statistics line, only including non-empty parts
-    let _ = write!(
-        buf,
-        "{}  {} {} {}",
-        "Statistics:".style(Style::new().bold()),
-        vite_str::format!(" {total} tasks").style(Style::new().bright_white()),
-        vite_str::format!("• {cache_hits} cache hits").style(Style::new().green()),
-        vite_str::format!("• {cache_misses} cache misses").style(CACHE_MISS_STYLE),
-    );
-    if !cache_disabled_str.is_empty() {
-        let _ = write!(buf, " {cache_disabled_str}");
-    }
-    if !failed_str.is_empty() {
-        let _ = write!(buf, " {failed_str}");
-    }
-    let _ = writeln!(buf);
-
-    // Calculate cache hit rate
-    let cache_rate = if total > 0 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "percentage is always 0..=100, fits in u32"
-        )]
-        #[expect(clippy::cast_sign_loss, reason = "percentage is always non-negative")]
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "acceptable precision loss for display percentage"
-        )]
-        {
-            (f64::from(cache_hits as u32) / total as f64 * 100.0) as u32
-        }
-    } else {
-        0
-    };
-
-    // Calculate total time saved from cache hits
-    let total_saved: Duration = executions
-        .iter()
-        .filter_map(|exec| {
-            if let CacheStatus::Hit { replayed_duration } = &exec.cache_status {
-                Some(*replayed_duration)
-            } else {
-                None
-            }
-        })
-        .sum();
-
-    let _ = write!(
-        buf,
-        "{}  {} cache hit rate",
-        "Performance:".style(Style::new().bold()),
-        format_args!("{cache_rate}%").style(if cache_rate >= 75 {
-            Style::new().green().bold()
-        } else if cache_rate >= 50 {
-            CACHE_MISS_STYLE
-        } else {
-            Style::new().red()
-        })
-    );
-
-    if total_saved > Duration::ZERO {
-        let _ =
-            write!(buf, ", {:.2?} saved in total", total_saved.style(Style::new().green().bold()));
-    }
-    let _ = writeln!(buf);
-    let _ = writeln!(buf);
-
-    // Detailed task results
-    let _ = writeln!(buf, "{}", "Task Details:".style(Style::new().bold()));
-    let _ = writeln!(
-        buf,
-        "{}",
-        "────────────────────────────────────────────────".style(Style::new().bright_black())
-    );
-
-    for (idx, exec) in executions.iter().enumerate() {
-        let display = &exec.display;
-
-        let task_display = &display.task_display;
-
-        // Task name and index
-        let _ = write!(
-            buf,
-            "  {} {}",
-            vite_str::format!("[{}]", idx + 1).style(Style::new().bright_black()),
-            task_display.to_string().style(Style::new().bright_white().bold())
-        );
-
-        // Command with cwd prefix
-        let command_display = format_command_display(display, workspace_path);
-        let _ = write!(buf, ": {}", command_display.style(COMMAND_STYLE));
-
-        // Execution result icon
-        // None means success (cache hit or in-process), Some checks actual status
-        match &exec.exit_status {
-            None => {
-                let _ = write!(buf, " {}", "✓".style(Style::new().green().bold()));
-            }
-            Some(exit_status) if exit_status.success() => {
-                let _ = write!(buf, " {}", "✓".style(Style::new().green().bold()));
-            }
-            Some(exit_status) => {
-                let code = exit_status_to_code(*exit_status);
-                let _ = write!(
-                    buf,
-                    " {} {}",
-                    "✗".style(Style::new().red().bold()),
-                    vite_str::format!("(exit code: {code})").style(Style::new().red())
-                );
-            }
-        }
-        let _ = writeln!(buf);
-
-        // Cache status details — use display module for plain text, apply styling here
-        let cache_summary = format_cache_status_summary(&exec.cache_status);
-        let styled_summary = match &exec.cache_status {
-            CacheStatus::Hit { .. } => cache_summary.style(Style::new().green()),
-            CacheStatus::Miss(_) => cache_summary.style(CACHE_MISS_STYLE),
-            CacheStatus::Disabled(_) => cache_summary.style(Style::new().bright_black()),
-        };
-        let _ = writeln!(buf, "      {styled_summary}");
-
-        // Error message if present
-        if let Some(ref error_msg) = exec.error_message {
-            let _ = writeln!(
-                buf,
-                "      {} {}",
-                "✗ Error:".style(Style::new().red().bold()),
-                error_msg.style(Style::new().red())
-            );
-        }
-
-        // Add spacing between tasks except for the last one
-        if idx < executions.len() - 1 {
-            let _ = writeln!(
-                buf,
-                "  {}",
-                "·······················································"
-                    .style(Style::new().bright_black())
-            );
-        }
-    }
-
-    let _ = writeln!(
-        buf,
-        "{}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".style(Style::new().bright_black())
-    );
-
-    buf
 }
 
 #[cfg(test)]
@@ -576,8 +326,12 @@ mod tests {
         leaf_kind: &LeafExecutionKind,
         all_ancestors_single_node: bool,
     ) -> Box<dyn LeafExecutionReporter> {
-        let builder =
-            Box::new(LabeledReporterBuilder::new(test_path(), Box::new(tokio::io::sink())));
+        let builder = Box::new(LabeledReporterBuilder::new(
+            test_path(),
+            Box::new(tokio::io::sink()),
+            false,
+            None,
+        ));
         let mut reporter = builder.build();
         reporter.new_leaf_execution(display, leaf_kind, all_ancestors_single_node)
     }

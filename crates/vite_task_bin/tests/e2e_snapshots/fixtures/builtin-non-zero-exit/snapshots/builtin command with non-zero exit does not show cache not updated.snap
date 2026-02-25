@@ -14,20 +14,6 @@ $ vp lint -D no-debugger
 
 Found 0 warnings and 1 error.
 Finished in <duration> on 1 file with 90 rules using <n> threads.
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    Vite+ Task Runner • Execution Summary
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Statistics:   1 tasks • 0 cache hits • 1 cache misses • 1 failed
-Performance:  0% cache hit rate
-
-Task Details:
-────────────────────────────────────────────────
-  [1] builtin-non-zero-exit-test#lint: $ vp lint -D no-debugger ✗ (exit code: 1)
-      → Cache miss: no previous cache entry found
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [1]> vp run lint -- -D no-debugger
 $ vp lint -D no-debugger
 
@@ -40,17 +26,3 @@ $ vp lint -D no-debugger
 
 Found 0 warnings and 1 error.
 Finished in <duration> on 1 file with 90 rules using <n> threads.
-
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    Vite+ Task Runner • Execution Summary
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Statistics:   1 tasks • 0 cache hits • 1 cache misses • 1 failed
-Performance:  0% cache hit rate
-
-Task Details:
-────────────────────────────────────────────────
-  [1] builtin-non-zero-exit-test#lint: $ vp lint -D no-debugger ✗ (exit code: 1)
-      → Cache miss: no previous cache entry found
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -174,8 +174,8 @@ fn run_case_inner(
                     continue;
                 }
             };
-            let Cli::Command(command) = cli;
-            let Command::Run(run_command) = command else {
+            let Cli::Command(parsed) = cli;
+            let Command::Run(run_command) = parsed else {
                 panic!("only `run` commands supported in plan tests")
             };
 

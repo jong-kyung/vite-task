@@ -130,7 +130,7 @@ impl vite_task::CommandHandler for CommandHandler {
                     envs: Arc::new(envs),
                 }))
             }
-            Args::Task(cli_command) => Ok(HandledCommand::ViteTaskCommand(cli_command)),
+            Args::Task(parsed) => Ok(HandledCommand::ViteTaskCommand(parsed)),
         }
     }
 }

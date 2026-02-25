@@ -19,25 +19,11 @@ Search task (↑/↓ to move, enter to select):
   task-select-test#format: echo format root
   (…3 more)
 @ write-key: enter
-~/packages/lib$ echo build lib ⊘ cache disabled: built-in command
+~/packages/lib$ echo build lib ⊘ cache disabled
 build lib
 
-~/packages/app$ echo build app ⊘ cache disabled: built-in command
+~/packages/app$ echo build app ⊘ cache disabled
 build app
 
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    Vite+ Task Runner • Execution Summary
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Statistics:   2 tasks • 0 cache hits • 0 cache misses • 2 cache disabled
-Performance:  0% cache hit rate
-
-Task Details:
-────────────────────────────────────────────────
-  [1] lib#build: ~/packages/lib$ echo build lib ✓
-      → Cache disabled for built-in command
-  ·······················································
-  [2] app#build: ~/packages/app$ echo build app ✓
-      → Cache disabled for built-in command
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+---
+[vp run] 0/2 cache hit (0%). (Run `vp run --last-details` for full details)
