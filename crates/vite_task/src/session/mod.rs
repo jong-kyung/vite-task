@@ -21,14 +21,16 @@ use vite_select::SelectItem;
 use vite_str::Str;
 use vite_task_graph::{
     IndexedTaskGraph, TaskGraph, TaskGraphLoadError, config::user::UserCacheConfig,
-    loader::UserConfigLoader,
+    loader::UserConfigLoader, query::TaskQuery,
 };
 use vite_task_plan::{
     ExecutionGraph, TaskGraphLoader,
-    plan_request::{PlanRequest, ScriptCommand, SyntheticPlanRequest},
+    plan_request::{
+        PlanOptions, PlanRequest, QueryPlanRequest, ScriptCommand, SyntheticPlanRequest,
+    },
     prepend_path_env,
 };
-use vite_workspace::{WorkspaceRoot, find_workspace_root};
+use vite_workspace::{WorkspaceRoot, find_workspace_root, package_graph::PackageQuery};
 
 use crate::cli::{CacheSubcommand, Command, ResolvedCommand, ResolvedRunCommand, RunCommand};
 
@@ -272,7 +274,7 @@ impl<'a> Session<'a> {
         match command.into_resolved() {
             ResolvedCommand::Cache { ref subcmd } => self.handle_cache_command(subcmd),
             ResolvedCommand::RunLastDetails => self.show_last_run_details(),
-            ResolvedCommand::Run(mut run_command) => {
+            ResolvedCommand::Run(run_command) => {
                 let is_interactive =
                     std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
@@ -286,9 +288,8 @@ impl<'a> Session<'a> {
                         // No tasks matched. With is_cwd_only (no scope flags) the
                         // task name is a typo — show the selector. Otherwise error.
                         if is_cwd_only {
-                            self.handle_no_task(is_interactive, &mut run_command).await?;
-                            let cwd = Arc::clone(&self.cwd);
-                            self.plan_from_cli_run_resolved(cwd, run_command.clone()).await?.0
+                            let qpr = self.handle_no_task(is_interactive, &run_command).await?;
+                            self.plan_from_query(qpr).await?
                         } else {
                             return Err(vite_task_plan::Error::NoTasksMatched(
                                 task_specifier.clone(),
@@ -307,9 +308,8 @@ impl<'a> Session<'a> {
                     if run_command != bare {
                         return Err(vite_task_plan::Error::MissingTaskSpecifier.into());
                     }
-                    self.handle_no_task(is_interactive, &mut run_command).await?;
-                    let cwd = Arc::clone(&self.cwd);
-                    self.plan_from_cli_run_resolved(cwd, run_command.clone()).await?.0
+                    let qpr = self.handle_no_task(is_interactive, &run_command).await?;
+                    self.plan_from_query(qpr).await?
                 };
 
                 let builder = LabeledReporterBuilder::new(
@@ -334,11 +334,11 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Show the task selector or list, and update the run command with the selected task.
+    /// Show the task selector or list, and return a plan request for the selected task.
     ///
     /// In interactive mode, shows a fuzzy-searchable selection list. On selection,
-    /// updates `run_command.task_specifier` and returns `Ok(())` so the caller
-    /// can plan and execute the selected task.
+    /// returns `Ok(QueryPlanRequest)` using the selected entry's filesystem path
+    /// (not its display name) for package matching.
     ///
     /// In non-interactive mode, prints the task list (or "did you mean" suggestions)
     /// and returns `Err(SessionError::EarlyExit(_))` — no further execution needed.
@@ -346,11 +346,15 @@ impl<'a> Session<'a> {
         clippy::future_not_send,
         reason = "session is single-threaded, futures do not need to be Send"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "builds interactive/non-interactive select items and handles selection"
+    )]
     async fn handle_no_task(
         &mut self,
         is_interactive: bool,
-        run_command: &mut ResolvedRunCommand,
-    ) -> Result<(), SessionError> {
+        run_command: &ResolvedRunCommand,
+    ) -> Result<QueryPlanRequest, SessionError> {
         let not_found_name = run_command.task_specifier.as_deref();
         let cwd = Arc::clone(&self.cwd);
         let task_graph = self.ensure_task_graph_loaded().await?;
@@ -363,18 +367,48 @@ impl<'a> Session<'a> {
                 .then_with(|| a.task_display.task_name.cmp(&b.task_display.task_name))
         });
 
+        let workspace_path = self.workspace_path();
+
         // Build items: current package tasks use unqualified names (no '#'),
         // other packages use qualified "package#task" names.
+        // Interactive mode uses tree view (grouped by package); non-interactive is flat.
         let select_items: Vec<SelectItem> = entries
             .iter()
             .map(|entry| {
-                let label =
-                    if current_package_path.as_ref() == Some(&entry.task_display.package_path) {
-                        entry.task_display.task_name.clone()
+                let is_current =
+                    current_package_path.as_ref() == Some(&entry.task_display.package_path);
+                let label = if is_current {
+                    entry.task_display.task_name.clone()
+                } else {
+                    vite_str::format!("{}", entry.task_display)
+                };
+
+                let group = if is_current {
+                    None
+                } else {
+                    let rel_path = entry
+                        .task_display
+                        .package_path
+                        .strip_prefix(&*workspace_path)
+                        .ok()
+                        .flatten()
+                        .map(|p| Str::from(p.as_str()))
+                        .unwrap_or_default();
+                    let pkg_name = &entry.task_display.package_name;
+                    let display_path =
+                        if rel_path.is_empty() { Str::from("workspace root") } else { rel_path };
+                    Some(if pkg_name.is_empty() {
+                        display_path
                     } else {
-                        vite_str::format!("{}", entry.task_display)
-                    };
-                SelectItem { label, description: entry.command.clone() }
+                        vite_str::format!("{pkg_name} ({display_path})")
+                    })
+                };
+                let display_name = if is_interactive {
+                    entry.task_display.task_name.clone()
+                } else {
+                    label.clone()
+                };
+                SelectItem { label, display_name, description: entry.command.clone(), group }
             })
             .collect();
 
@@ -410,28 +444,15 @@ impl<'a> Session<'a> {
             page_size: 12,
         };
 
-        vite_select::select_list(
-            &mut stdout,
-            &params,
-            mode,
-            |filtered, query| {
-                // When the query doesn't contain '#', move current-package tasks (those
-                // without '#' in their label) to the top. `sort_by_key` is a stable sort,
-                // so the fuzzy rating order is preserved within each group.
-                if !query.contains('#') {
-                    filtered.sort_by_key(|&idx| select_items[idx].label.contains('#'));
-                }
-            },
-            |state| {
-                use std::io::Write;
-                let milestone_name =
-                    vite_str::format!("task-select:{}:{}", state.query, state.selected_index);
-                let milestone_bytes = pty_terminal_test_client::encoded_milestone(&milestone_name);
-                let mut out = std::io::stdout();
-                let _ = out.write_all(&milestone_bytes);
-                let _ = out.flush();
-            },
-        )?;
+        vite_select::select_list(&mut stdout, &params, mode, |state| {
+            use std::io::Write;
+            let milestone_name =
+                vite_str::format!("task-select:{}:{}", state.query, state.selected_index);
+            let milestone_bytes = pty_terminal_test_client::encoded_milestone(&milestone_name);
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&milestone_bytes);
+            let _ = out.flush();
+        })?;
 
         let Some(selected_index) = selected_index else {
             // Non-interactive, the list was printed.
@@ -444,7 +465,9 @@ impl<'a> Session<'a> {
             }));
         };
 
-        // Interactive: print selected task and run it
+        // Interactive: print selected task and build a QueryPlanRequest using the
+        // entry's filesystem path (not its display name) for package matching.
+        let entry = &entries[selected_index];
         let selected_label = &select_items[selected_index].label;
         {
             use std::io::Write as _;
@@ -457,8 +480,20 @@ impl<'a> Session<'a> {
                 selected_label,
             )?;
         }
-        run_command.task_specifier = Some(selected_label.clone());
-        Ok(())
+
+        let package_query =
+            PackageQuery::containing_package(Arc::clone(&entry.task_display.package_path));
+        Ok(QueryPlanRequest {
+            query: TaskQuery {
+                package_query,
+                task_name: entry.task_display.task_name.clone(),
+                include_explicit_deps: !run_command.flags.ignore_depends_on,
+            },
+            plan_options: PlanOptions {
+                extra_args: run_command.additional_args.clone().into(),
+                cache_override: run_command.flags.cache_override(),
+            },
+        })
     }
 
     /// Lazily initializes and returns the execution cache.
@@ -669,5 +704,29 @@ impl<'a> Session<'a> {
         )
         .await?;
         Ok((graph, is_cwd_only))
+    }
+
+    /// Plan execution from a pre-built [`QueryPlanRequest`].
+    ///
+    /// Used by the interactive task selector, which constructs the request
+    /// directly (bypassing CLI specifier parsing).
+    #[expect(
+        clippy::future_not_send,
+        reason = "session is single-threaded, futures do not need to be Send"
+    )]
+    async fn plan_from_query(
+        &mut self,
+        request: QueryPlanRequest,
+    ) -> Result<ExecutionGraph, vite_task_plan::Error> {
+        let cwd = Arc::clone(&self.cwd);
+        vite_task_plan::plan_query(
+            request,
+            &self.workspace_path,
+            &cwd,
+            &self.envs,
+            &mut self.plan_request_parser,
+            &mut self.lazy_task_graph,
+        )
+        .await
     }
 }
