@@ -95,6 +95,12 @@ pub enum TaskGraphLoadError {
         error: anyhow::Error,
     },
 
+    #[error(
+        "Task {task_display} conflicts with a package.json script of the same name. \
+         Remove the script from package.json or rename the task"
+    )]
+    ScriptConflict { task_display: TaskDisplay },
+
     #[error("Failed to resolve task config for task {task_display}")]
     ResolveConfigError {
         task_display: TaskDisplay,
@@ -264,18 +270,25 @@ impl IndexedTaskGraph {
                 .collect();
 
             for (task_name, task_user_config) in user_config.tasks.unwrap_or_default() {
-                // For each task defined in the config, look up the corresponding package.json script (if any)
-                let package_json_script = package_json_scripts.remove(task_name.as_str());
+                // Error if a package.json script with the same name exists
+                if package_json_scripts.remove(task_name.as_str()).is_some() {
+                    return Err(TaskGraphLoadError::ScriptConflict {
+                        task_display: TaskDisplay {
+                            package_name: package.package_json.name.clone(),
+                            task_name: task_name.clone(),
+                            package_path: Arc::clone(&package_dir),
+                        },
+                    });
+                }
 
                 let task_id = TaskId { task_name: task_name.clone(), package_index };
 
                 let dependency_specifiers = task_user_config.options.depends_on.clone();
 
-                // Resolve the task configuration combining config and package.json script
+                // Resolve the task configuration from the user config
                 let resolved_config = ResolvedTaskConfig::resolve(
                     task_user_config,
                     &package_dir,
-                    package_json_script,
                     &workspace_root.path,
                 )
                 .map_err(|err| TaskGraphLoadError::ResolveConfigError {
