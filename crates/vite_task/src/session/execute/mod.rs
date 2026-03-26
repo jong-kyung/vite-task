@@ -3,13 +3,17 @@ pub mod glob_inputs;
 mod hash;
 pub mod spawn;
 
-use std::{collections::BTreeMap, io::Write as _, process::Stdio, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, io::Write as _, process::Stdio, sync::Arc};
 
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
+use petgraph::Direction;
+use rustc_hash::FxHashMap;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use vite_path::AbsolutePath;
 use vite_task_plan::{
     ExecutionGraph, ExecutionItemDisplay, ExecutionItemKind, LeafExecutionKind, SpawnCommand,
-    SpawnExecution,
+    SpawnExecution, execution_graph::ExecutionNodeIndex,
 };
 
 use self::{
@@ -46,80 +50,147 @@ pub enum SpawnOutcome {
     Failed,
 }
 
-/// Holds mutable references needed during graph execution.
+/// Maximum number of tasks that can execute concurrently within a single
+/// execution graph level.
+const CONCURRENCY_LIMIT: usize = 10;
+
+/// Holds shared references needed during graph execution.
 ///
-/// The `reporter` field is used to create leaf reporters for individual executions.
+/// The `reporter` field is wrapped in `RefCell` because concurrent futures
+/// (via `FuturesUnordered`) need shared access to create leaf reporters.
+/// Since all futures run on a single thread (no `tokio::spawn`), `RefCell`
+/// is sufficient for interior mutability.
+///
 /// Cache fields are passed through to [`execute_spawn`] for cache-aware execution.
 struct ExecutionContext<'a> {
     /// The graph-level reporter, used to create leaf reporters via `new_leaf_execution()`.
-    reporter: &'a mut dyn GraphExecutionReporter,
+    /// Wrapped in `RefCell` for shared access from concurrent task futures.
+    reporter: &'a RefCell<Box<dyn GraphExecutionReporter>>,
     /// The execution cache for looking up and storing cached results.
     cache: &'a ExecutionCache,
     /// Base path for resolving relative paths in cache entries.
     /// Typically the workspace root.
     cache_base_path: &'a Arc<AbsolutePath>,
+    /// Token for cancelling in-flight child processes.
+    cancellation_token: CancellationToken,
 }
 
 impl ExecutionContext<'_> {
-    /// Execute all tasks in an execution graph in dependency order.
+    /// Execute all tasks in an execution graph concurrently, respecting dependencies.
     ///
-    /// `ExecutionGraph` guarantees acyclicity at construction time.
-    /// We compute a topological order and iterate in reverse to get execution order
-    /// (dependencies before dependents).
+    /// Uses a DAG scheduler: tasks whose dependencies have all completed are scheduled
+    /// onto a `FuturesUnordered`, bounded by a per-graph `Semaphore` with
+    /// [`CONCURRENCY_LIMIT`] permits. Each recursive `Expanded` graph creates its own
+    /// semaphore, so nested graphs have independent concurrency limits.
     ///
-    /// Fast-fail: if any task fails (non-zero exit or infrastructure error), remaining
-    /// tasks and `&&`-chained items are skipped. Leaf-level errors are reported through
-    /// the reporter. Cycle detection is handled at plan time.
-    ///
-    /// Returns `true` if all tasks succeeded, `false` if any task failed.
+    /// Fast-fail: if any task fails, `execute_leaf` cancels the `CancellationToken`
+    /// (killing in-flight child processes). This method detects the cancellation,
+    /// closes the semaphore, drains remaining futures, and returns.
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn execute_expanded_graph(&mut self, graph: &ExecutionGraph) -> bool {
-        // `compute_topological_order()` returns nodes in topological order: for every
-        // edge A→B, A appears before B. Since our edges mean "A depends on B",
-        // dependencies (B) appear after their dependents (A). We iterate in reverse
-        // to get execution order where dependencies run first.
+    async fn execute_expanded_graph(&self, graph: &ExecutionGraph) {
+        if graph.node_count() == 0 {
+            return;
+        }
 
-        // Execute tasks in dependency-first order. Each task may have multiple items
-        // (from `&&`-split commands), which are executed sequentially.
-        // If any task fails, subsequent tasks and items are skipped (fast-fail).
-        let topo_order = graph.compute_topological_order();
-        for &node_ix in topo_order.iter().rev() {
-            let task_execution = &graph[node_ix];
+        let semaphore = Arc::new(Semaphore::new(CONCURRENCY_LIMIT));
 
-            for item in &task_execution.items {
-                let failed = match &item.kind {
-                    ExecutionItemKind::Leaf(leaf_kind) => {
-                        self.execute_leaf(&item.execution_item_display, leaf_kind)
-                            .boxed_local()
-                            .await
-                    }
-                    ExecutionItemKind::Expanded(nested_graph) => {
-                        !self.execute_expanded_graph(nested_graph).boxed_local().await
-                    }
-                };
-                if failed {
-                    return false;
+        // Compute dependency count for each node.
+        // Edge A→B means "A depends on B", so A's dependency count = outgoing edge count.
+        let mut dep_count: FxHashMap<ExecutionNodeIndex, usize> = FxHashMap::default();
+        for node_ix in graph.node_indices() {
+            dep_count.insert(node_ix, graph.neighbors(node_ix).count());
+        }
+
+        let mut futures = FuturesUnordered::new();
+
+        // Schedule initially ready nodes (no dependencies).
+        for (&node_ix, &count) in &dep_count {
+            if count == 0 {
+                futures.push(self.spawn_node(graph, node_ix, &semaphore));
+            }
+        }
+
+        // Process completions and schedule newly ready dependents.
+        // On failure, `execute_leaf` cancels the token — we detect it here, close
+        // the semaphore (so pending acquires fail immediately), and drain.
+        while let Some(completed_ix) = futures.next().await {
+            if self.cancellation_token.is_cancelled() {
+                semaphore.close();
+                while futures.next().await.is_some() {}
+                return;
+            }
+
+            // Find dependents of the completed node (nodes that depend on it).
+            // Edge X→completed means "X depends on completed", so X is a predecessor
+            // in graph direction = neighbor in Incoming direction.
+            for dependent in graph.neighbors_directed(completed_ix, Direction::Incoming) {
+                let count = dep_count.get_mut(&dependent).expect("all nodes are in dep_count");
+                *count -= 1;
+                if *count == 0 {
+                    futures.push(self.spawn_node(graph, dependent, &semaphore));
                 }
             }
         }
-        true
+    }
+
+    /// Create a future that acquires a semaphore permit, then executes a graph node.
+    ///
+    /// On failure, `execute_node` cancels the `CancellationToken` — the caller
+    /// detects this after the future completes. On semaphore closure or prior
+    /// cancellation, the node is skipped.
+    fn spawn_node<'a>(
+        &'a self,
+        graph: &'a ExecutionGraph,
+        node_ix: ExecutionNodeIndex,
+        semaphore: &Arc<Semaphore>,
+    ) -> LocalBoxFuture<'a, ExecutionNodeIndex> {
+        let sem = semaphore.clone();
+        async move {
+            if let Ok(_permit) = sem.acquire_owned().await
+                && !self.cancellation_token.is_cancelled()
+            {
+                self.execute_node(graph, node_ix).await;
+            }
+            node_ix
+        }
+        .boxed_local()
+    }
+
+    /// Execute a single node's items sequentially.
+    ///
+    /// A node may have multiple items (from `&&`-split commands). Items are executed
+    /// in order; if any item fails, `execute_leaf` cancels the `CancellationToken`
+    /// and remaining items are skipped (preserving `&&` semantics).
+    async fn execute_node(&self, graph: &ExecutionGraph, node_ix: ExecutionNodeIndex) {
+        let task_execution = &graph[node_ix];
+
+        for item in &task_execution.items {
+            if self.cancellation_token.is_cancelled() {
+                return;
+            }
+            match &item.kind {
+                ExecutionItemKind::Leaf(leaf_kind) => {
+                    self.execute_leaf(&item.execution_item_display, leaf_kind).boxed_local().await;
+                }
+                ExecutionItemKind::Expanded(nested_graph) => {
+                    self.execute_expanded_graph(nested_graph).boxed_local().await;
+                }
+            }
+        }
     }
 
     /// Execute a single leaf item (in-process command or spawned process).
     ///
     /// Creates a [`LeafExecutionReporter`] from the graph reporter and delegates
-    /// to the appropriate execution method.
-    ///
-    /// Returns `true` if the execution failed (non-zero exit or infrastructure error).
+    /// to the appropriate execution method. On failure (non-zero exit or
+    /// infrastructure error), cancels the `CancellationToken`.
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn execute_leaf(
-        &mut self,
-        display: &ExecutionItemDisplay,
-        leaf_kind: &LeafExecutionKind,
-    ) -> bool {
-        let mut leaf_reporter = self.reporter.new_leaf_execution(display, leaf_kind);
+    async fn execute_leaf(&self, display: &ExecutionItemDisplay, leaf_kind: &LeafExecutionKind) {
+        // Borrow the reporter briefly to create the leaf reporter, then drop
+        // the RefCell guard before any `.await` point.
+        let mut leaf_reporter = self.reporter.borrow_mut().new_leaf_execution(display, leaf_kind);
 
-        match leaf_kind {
+        let failed = match leaf_kind {
             LeafExecutionKind::InProcess(in_process_execution) => {
                 // In-process (built-in) commands: caching is disabled, execute synchronously
                 let mut stdio_config = leaf_reporter
@@ -142,15 +213,23 @@ impl ExecutionContext<'_> {
                     clippy::large_futures,
                     reason = "spawn execution with cache management creates large futures"
                 )]
-                let outcome =
-                    execute_spawn(leaf_reporter, spawn_execution, self.cache, self.cache_base_path)
-                        .await;
+                let outcome = execute_spawn(
+                    leaf_reporter,
+                    spawn_execution,
+                    self.cache,
+                    self.cache_base_path,
+                    self.cancellation_token.clone(),
+                )
+                .await;
                 match outcome {
                     SpawnOutcome::CacheHit => false,
                     SpawnOutcome::Spawned(status) => !status.success(),
                     SpawnOutcome::Failed => true,
                 }
             }
+        };
+        if failed {
+            self.cancellation_token.cancel();
         }
     }
 }
@@ -179,6 +258,7 @@ pub async fn execute_spawn(
     spawn_execution: &SpawnExecution,
     cache: &ExecutionCache,
     cache_base_path: &Arc<AbsolutePath>,
+    cancellation_token: CancellationToken,
 ) -> SpawnOutcome {
     let cache_metadata = spawn_execution.cache_metadata.as_ref();
 
@@ -271,7 +351,7 @@ pub async fn execute_spawn(
         // while the child also writes to the same FD.
         drop(stdio_config);
 
-        match spawn_inherited(&spawn_execution.spawn_command).await {
+        match spawn_inherited(&spawn_execution.spawn_command, cancellation_token).await {
             Ok(result) => {
                 leaf_reporter.finish(
                     Some(result.exit_status),
@@ -342,6 +422,7 @@ pub async fn execute_spawn(
         std_outputs.as_mut(),
         path_accesses.as_mut(),
         &resolved_negatives,
+        cancellation_token,
     )
     .await
     {
@@ -439,7 +520,10 @@ pub async fn execute_spawn(
 /// The child process will see `is_terminal() == true` for stdout/stderr when the
 /// parent is running in a terminal. This is expected behavior.
 #[tracing::instrument(level = "debug", skip_all)]
-async fn spawn_inherited(spawn_command: &SpawnCommand) -> anyhow::Result<SpawnResult> {
+async fn spawn_inherited(
+    spawn_command: &SpawnCommand,
+    cancellation_token: CancellationToken,
+) -> anyhow::Result<SpawnResult> {
     let mut cmd = fspy::Command::new(spawn_command.program_path.as_path());
     cmd.args(spawn_command.args.iter().map(vite_str::Str::as_str));
     cmd.envs(spawn_command.all_envs.iter());
@@ -481,9 +565,122 @@ async fn spawn_inherited(spawn_command: &SpawnCommand) -> anyhow::Result<SpawnRe
     }
 
     let mut child = tokio_cmd.spawn()?;
-    let exit_status = child.wait().await?;
+
+    // On Windows, assign the child to a Job Object with KILL_ON_JOB_CLOSE so that
+    // all descendant processes (e.g., node.exe spawned by a .cmd shim) are killed
+    // when the job handle is dropped. Without this, TerminateProcess only kills the
+    // direct child, leaving grandchildren alive.
+    #[cfg(windows)]
+    let _job = {
+        use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+        // Duplicate the process handle so the job outlives tokio's handle.
+        // SAFETY: The child was just spawned, so its raw handle is valid.
+        let borrowed = unsafe { BorrowedHandle::borrow_raw(child.raw_handle().unwrap()) };
+        let owned = borrowed.try_clone_to_owned()?;
+        win_job::assign_to_kill_on_close_job(owned.as_raw_handle())?
+    };
+
+    let exit_status = tokio::select! {
+        status = child.wait() => status?,
+        () = cancellation_token.cancelled() => {
+            child.start_kill()?;
+            child.wait().await?
+        }
+    };
 
     Ok(SpawnResult { exit_status, duration: start.elapsed() })
+}
+
+/// Win32 Job Object utilities for process tree management.
+///
+/// On Windows, `TerminateProcess` only kills the direct child process, not its
+/// descendants. This module creates a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
+/// which automatically terminates all processes in the job when the handle is dropped.
+#[cfg(windows)]
+mod win_job {
+    use std::{io, os::windows::io::RawHandle};
+
+    use winapi::{
+        shared::minwindef::FALSE,
+        um::{
+            handleapi::CloseHandle,
+            jobapi2::{
+                AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+                TerminateJobObject,
+            },
+            winnt::{
+                HANDLE, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            },
+        },
+    };
+
+    /// RAII wrapper around a Win32 Job Object `HANDLE` that closes it on drop.
+    pub(super) struct OwnedJobHandle(HANDLE);
+
+    impl OwnedJobHandle {
+        /// Immediately terminate all processes in the job.
+        ///
+        /// This is needed when pipes to a grandchild process must be closed before
+        /// the job handle is dropped (e.g., to unblock pipe reads in `spawn_with_tracking`).
+        pub(super) fn terminate(&self) {
+            // SAFETY: self.0 is a valid job handle from CreateJobObjectW.
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+
+    impl Drop for OwnedJobHandle {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is a valid handle obtained from CreateJobObjectW.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Create a Job Object with `KILL_ON_JOB_CLOSE` and assign a process to it.
+    ///
+    /// Returns the job handle wrapped in an RAII guard. When dropped, all processes
+    /// in the job (the child and its descendants) are terminated.
+    pub(super) fn assign_to_kill_on_close_job(
+        process_handle: RawHandle,
+    ) -> io::Result<OwnedJobHandle> {
+        // SAFETY: Creating an anonymous job object with no security attributes.
+        let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = OwnedJobHandle(job);
+
+        // Configure the job to kill all processes when the handle is closed.
+        // SAFETY: JOBOBJECT_EXTENDED_LIMIT_INFORMATION is a plain C struct (no pointers
+        // in the zeroed fields). Zeroing then setting LimitFlags is the standard pattern.
+        let mut info = unsafe {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            info
+        };
+
+        // SAFETY: info is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION, job.0 is a valid handle.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.0,
+                // JobObjectExtendedLimitInformation = 9
+                9,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>().try_into().unwrap(),
+            )
+        };
+        if ok == FALSE {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: Both handles are valid — job from CreateJobObjectW, process handle
+        // from the caller.
+        let ok = unsafe { AssignProcessToJobObject(job.0, process_handle as HANDLE) };
+        if ok == FALSE {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(job)
+    }
 }
 
 impl Session<'_> {
@@ -513,12 +710,13 @@ impl Session<'_> {
             }
         };
 
-        let mut reporter = builder.build();
+        let reporter = RefCell::new(builder.build());
 
-        let mut execution_context = ExecutionContext {
-            reporter: &mut *reporter,
+        let execution_context = ExecutionContext {
+            reporter: &reporter,
             cache,
             cache_base_path: &self.workspace_path,
+            cancellation_token: CancellationToken::new(),
         };
 
         // Execute the graph with fast-fail: if any task fails, remaining tasks
@@ -527,6 +725,6 @@ impl Session<'_> {
 
         // Leaf-level errors and non-zero exit statuses are tracked internally
         // by the reporter.
-        reporter.finish()
+        reporter.into_inner().finish()
     }
 }
