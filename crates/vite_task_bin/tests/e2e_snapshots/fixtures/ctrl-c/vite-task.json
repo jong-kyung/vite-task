@@ -1,0 +1,8 @@
+{
+  "cache": false,
+  "tasks": {
+    "dev": {
+      "command": "vtt exit-on-ctrlc"
+    }
+  }
+}
